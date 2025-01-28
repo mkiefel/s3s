@@ -8,7 +8,6 @@ use s3s::S3Result;
 use s3s::S3;
 use s3s::{S3Request, S3Response};
 
-use std::collections::VecDeque;
 use std::io;
 use std::ops::Neg;
 use std::ops::Not;
@@ -346,6 +345,7 @@ impl S3 for FileSystem {
             name: v2.name,
             prefix: v2.prefix,
             max_keys: v2.max_keys,
+            common_prefixes: v2.common_prefixes,
             ..Default::default()
         }))
     }
@@ -353,54 +353,53 @@ impl S3 for FileSystem {
     #[tracing::instrument]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
         let input = req.input;
-        let path = self.get_bucket_path(&input.bucket)?;
+        let bucket_path = self.get_bucket_path(&input.bucket)?;
 
-        if path.exists().not() {
+        if bucket_path.exists().not() {
             return Err(s3_error!(NoSuchBucket));
         }
 
+        if input.delimiter.is_none() {
+            return Err(s3_error!(NotImplemented));
+        }
+
+        let delimiter = input.delimiter.unwrap();
+
+        if delimiter != "/" {
+            return Err(s3_error!(NotImplemented));
+        }
+
         let mut objects: Vec<Object> = default();
-        let mut dir_queue: VecDeque<PathBuf> = default();
-        dir_queue.push_back(path.clone());
+        let mut common_prefixes: Vec<CommonPrefix> = default();
 
-        while let Some(dir) = dir_queue.pop_front() {
-            let mut iter = try_!(fs::read_dir(dir).await);
-            while let Some(entry) = try_!(iter.next_entry().await) {
-                let file_type = try_!(entry.file_type().await);
-                if file_type.is_dir() {
-                    dir_queue.push_back(entry.path());
-                } else {
-                    let file_path = entry.path();
-                    let key = try_!(file_path.strip_prefix(&path));
-                    let delimiter = input.delimiter.as_ref().map_or("/", |d| d.as_str());
-                    let Some(key_str) = normalize_path(key, delimiter) else {
-                        continue;
-                    };
+        let mut path = bucket_path.clone();
+        path.push(input.prefix.clone().unwrap_or("".to_owned()));
 
-                    if let Some(ref prefix) = input.prefix {
-                        let prefix_path: PathBuf = prefix.split(delimiter).collect();
-
-                        let key_s = format!("{}", key.display());
-                        let prefix_path_s = format!("{}", prefix_path.display());
-
-                        if !key_s.starts_with(&prefix_path_s) {
-                            continue;
-                        }
-                    }
-
-                    let metadata = try_!(entry.metadata().await);
-                    let last_modified = Timestamp::from(try_!(metadata.modified()));
-                    let size = metadata.len();
-
-                    let object = Object {
-                        key: Some(key_str),
-                        last_modified: Some(last_modified),
-                        size: Some(try_!(i64::try_from(size))),
-                        ..Default::default()
-                    };
-                    objects.push(object);
-                }
+        let mut iter = try_!(fs::read_dir(&path).await);
+        while let Some(entry) = try_!(iter.next_entry().await) {
+            let file_type = try_!(entry.file_type().await);
+            let file_path = entry.path();
+            let key = try_!(file_path.strip_prefix(&bucket_path));
+            let Some(key_str) = normalize_path(key, &delimiter) else {
+                continue;
+            };
+            if file_type.is_dir() {
+                common_prefixes.push(CommonPrefix { prefix: Some(key_str) });
+            } else {
+                let metadata = try_!(entry.metadata().await);
+                let last_modified = Timestamp::from(try_!(metadata.modified()));
+                let size = metadata.len();
+                objects.push(Object {
+                    key: Some(key_str),
+                    last_modified: Some(last_modified),
+                    size: Some(try_!(i64::try_from(size))),
+                    ..Default::default()
+                });
             }
+        }
+
+        if let Some(_) = input.start_after {
+            return Err(s3_error!(NotImplemented));
         }
 
         objects.sort_by(|lhs, rhs| {
@@ -409,22 +408,14 @@ impl S3 for FileSystem {
             lhs_key.cmp(rhs_key)
         });
 
-        let objects = if let Some(marker) = &input.start_after {
-            objects
-                .into_iter()
-                .skip_while(|n| n.key.as_deref().unwrap_or("") <= marker.as_str())
-                .collect()
-        } else {
-            objects
-        };
-
-        let key_count = try_!(i32::try_from(objects.len()));
+        let key_count = try_!(i32::try_from(objects.len())) + try_!(i32::try_from(common_prefixes.len()));
 
         let output = ListObjectsV2Output {
             key_count: Some(key_count),
             max_keys: Some(key_count),
             contents: Some(objects),
-            delimiter: input.delimiter,
+            common_prefixes: Some(common_prefixes),
+            delimiter: Some(delimiter),
             encoding_type: input.encoding_type,
             name: Some(input.bucket),
             prefix: input.prefix,
